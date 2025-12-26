@@ -3,6 +3,7 @@
 #include <cassert>
 #include <iostream>
 #include <algorithm>
+#include <numeric>
 vol_t ofm_ubuf_vol;
 
 cost_t default_cost(energy_t energy, cycle_t time){
@@ -202,7 +203,7 @@ cidx_t dis(const pos_t& x, const pos_t& y){
 	return std::abs(x.x-y.x)+std::abs(x.y-y.y);
 }
 len_t getGCD(len_t a, len_t b) {
-	return std::__gcd(a, b);
+	return std::gcd(a, b);
 }
 /*
 int divceil(int m, int n) {

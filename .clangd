@@ -1,0 +1,8 @@
+CompileFlags:
+  CompilationDatabase: .vscode/
+
+Diagnostics:
+  UnusedIncludes: None
+  Suppress:
+    - in_class_initializer_non_constant
+    - typecheck_range_value

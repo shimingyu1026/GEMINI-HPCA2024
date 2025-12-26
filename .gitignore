@@ -100,3 +100,6 @@ output/
 once_output/
 tmp/
 tmp/todo
+
+.vscode
+.xmake
