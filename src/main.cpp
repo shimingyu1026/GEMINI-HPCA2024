@@ -8,6 +8,7 @@
 #include "spatial_mapping/segmentation.h"
 #include "debug.h"
 #include "cost.h"
+#include "export.h"
 
 #include "nns/nns.h"
 
@@ -1024,7 +1025,7 @@ int main(int argc, char** argv){
 	tops /= 1024;
 	//NUMBER
 	double core_num = Cluster::xlen * Cluster::ylen;
-	double compute_die_num = NoC::x_cut * NoC::y_cut;
+	int compute_die_num = NoC::x_cut * NoC::y_cut;
 	double NoP_side_num;//how many sides of 
 	double IO_die_num = 0;
 	int serdes_number = 0;//calculate the number of serdes for all noc nodes (assuming each side of a node has a serdes)
@@ -1456,6 +1457,7 @@ int main(int argc, char** argv){
 			<< _ul3 << ' ' << total_tops << endl;
 #endif
 	Segment_scheme *scheme;
+	ExportArtifacts artifacts;
 
 #if FORMAT_OUTPUT
 	FILE *file;
@@ -1495,7 +1497,14 @@ int main(int argc, char** argv){
 	mode_control(false, false, true);
 	scheme = DP_search(SAEngine::nrounds, false, false);
 	if (scheme != nullptr) {
+		artifacts = export_chiplet_artifacts(
+			*scheme->schtree_spm,
+			argc > 1 ? argv[1] : "",
+			net_name
+		);
 		output(3);
+		cout << "chiplet_events_json: " << artifacts.chiplet_events_path << endl;
+		cout << "scalesim_topology_csv: " << artifacts.scalesim_topology_path << endl;
 		delete scheme;
 	}
 

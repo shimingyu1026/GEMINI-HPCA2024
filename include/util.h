@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <numeric>
 #include <limits>
 #include <iostream>
 

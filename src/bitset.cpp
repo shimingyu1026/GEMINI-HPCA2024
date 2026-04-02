@@ -41,11 +41,21 @@ Bitset::bitlen_t Bitset::count() const{
 }
 
 Bitset::bitlen_t Bitset::first() const{
-	return static_cast<Bitset::bitlen_t>(_Find_first());
+	for(bitlen_t bit = 0; bit < max_size(); ++bit){
+		if(std_bs::test(bit)){
+			return bit;
+		}
+	}
+	return max_size();
 }
 
 Bitset::bitlen_t Bitset::next(Bitset::bitlen_t bit) const{
-	return static_cast<Bitset::bitlen_t>(_Find_next(bit));
+	for(bitlen_t next_bit = bit + 1; next_bit < max_size(); ++next_bit){
+		if(std_bs::test(next_bit)){
+			return next_bit;
+		}
+	}
+	return max_size();
 }
 Bitset::bitlen_t Bitset::find_nth_1(Bitset::bitlen_t bit) const {
 	bitlen_t i = first();
