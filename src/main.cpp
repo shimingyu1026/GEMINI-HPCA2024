@@ -844,6 +844,47 @@ double wafer_util(double area) {
 		return 0.743;
 	}
 }
+
+std::vector<double> scaled_buffer(int width, vol_t size) {
+	static const vol_t supported_sizes[] = {
+		1 KB, 2 KB, 4 KB, 8 KB, 16 KB, 32 KB
+	};
+	vol_t base = supported_sizes[0];
+	for (vol_t candidate : supported_sizes) {
+		if (size >= candidate) {
+			base = candidate;
+		}
+	}
+	std::vector<double> access = buffer(width, base);
+	if (size != base) {
+		double scale = std::sqrt(static_cast<double>(size) / static_cast<double>(base));
+		access[0] *= scale;
+		access[1] *= scale;
+	}
+	return access;
+}
+
+std::pair<std::uint16_t, std::uint16_t> factorize_eyeriss_array(int mac_num) {
+	if (mac_num <= 0) {
+		throw runtime_error("Eyeriss PE count must be positive.");
+	}
+	const int max_dim = std::numeric_limits<EyerissCore::vmac_t>::max();
+	const int root = static_cast<int>(std::sqrt(static_cast<double>(mac_num)));
+	for (int y = root; y >= 1; --y) {
+		if (mac_num % y != 0) {
+			continue;
+		}
+		const int x = mac_num / y;
+		if (x <= max_dim && y <= max_dim) {
+			return {
+				static_cast<std::uint16_t>(x),
+				static_cast<std::uint16_t>(y)
+			};
+		}
+	}
+	throw runtime_error("Cannot factorize Eyeriss PE count into a valid 2D array.");
+}
+
 int main(int argc, char** argv){
 	unsigned int seed = time(NULL);
 	srand(seed);
@@ -865,6 +906,11 @@ int main(int argc, char** argv){
 	//xcut & ycut means the chiplet partition granularity at the x and y dimension.
 	//the remaining few parameters represent the architecture parameters as their names.
 	/********************* INPUT *********************/
+	if (mm == 1) {
+		// TPU-like exploration uses one 2D array core per chiplet.
+		xcut = xx;
+		ycut = yy;
+	}
 	bw_t NoP_bw = _NoP_bw;
 	NoC::DRAM_bw = _DRAM_bw/1024/4;     
 	SchNode::DRAM_bw = _DRAM_bw/1024/4;   
@@ -977,31 +1023,10 @@ int main(int argc, char** argv){
 		throw runtime_error("DDR type not supported.");
 	}
 
-	std::uint16_t vector_len;
-	std::uint16_t lane_len;
-	if (mac_dim == 512) {
-		vector_len = 4;
-		lane_len = 8;
-	}
-	else if (mac_dim == 1024) {
-		vector_len = 8;
-		lane_len = 8;
-	}
-	else if (mac_dim == 2048) {
-		vector_len = 8;
-		lane_len = 16;
-	}
-	else if (mac_dim == 4096) {
-		vector_len = 16;
-		lane_len = 16;
-	}
-	else if (mac_dim == 8192) {
-		vector_len = 16;
-		lane_len = 32;
-	}
-	else {
-		throw runtime_error("MAC scale not supported·");
-	}
+	std::uint16_t vector_len = 0;
+	std::uint16_t lane_len = 0;
+	std::uint16_t eyeriss_x = 0;
+	std::uint16_t eyeriss_y = 0;
 	NoC::seperate_IO = true;
 	double turnover_factor = 0.3/0.5;
 	ofm_ubuf_vol = 10 KB;
@@ -1009,19 +1034,78 @@ int main(int argc, char** argv){
 	NoC::NoC_hop_cost = 0.4 * 8 * power_factor;
 	
 	energy_t LR_mac_cost = 0.0873 * power_factor; //IEEE FP16
-	Core::numMac_t LR_mac_num = vector_len * lane_len * 16 / 16;
+	Core::numMac_t LR_mac_num = 0;
+	Core::numMac_t macs_per_core = 0;
 	PolarCore::Buffer al1, wl1, ol1, al2, wl2, ol2, ul3;
+	EyerissCore::Buffer _al1, _wl1, pl1, ul2;
+	EyerissCore::Bus ibus(0.018, 64);
+	EyerissCore::Bus wbus(0.018, 64);
+	EyerissCore::Bus pbus(0.018, 64); // ifmap RC, weight RCK, psum RK
+	double sram_area_per_core = 0;
+	double mac_area_per_core = 0;
+	double NoC_area_per_core = NoC::NoC_bw * NoC_den;
+
+	if(mm == 0){
+		if (mac_dim == 512) {
+			vector_len = 4;
+			lane_len = 8;
+		}
+		else if (mac_dim == 1024) {
+			vector_len = 8;
+			lane_len = 8;
+		}
+		else if (mac_dim == 2048) {
+			vector_len = 8;
+			lane_len = 16;
+		}
+		else if (mac_dim == 4096) {
+			vector_len = 16;
+			lane_len = 16;
+		}
+		else if (mac_dim == 8192) {
+			vector_len = 16;
+			lane_len = 32;
+		}
+		else {
+			throw runtime_error("MAC scale not supported.");
+		}
+		LR_mac_num = vector_len * lane_len;
+		macs_per_core = static_cast<Core::numMac_t>(16 * vector_len * lane_len);
+
+		al1.Size = 8 * vector_len / 8 KB; 
+		ol1.Size = 2 * lane_len / 8 KB; 
+		wl1.Size = 4 * lane_len*vector_len / 64 KB; 
+		ol2.Size = 28 * vector_len * lane_len / 64 KB; 
+		wl2.Size = 0;//256 KB;
+		ul3.Size = ul3_; //16 64-bit IO 64KB 1-port MBSRAM
+		SchNode::ubuf = ul3.Size;
+
+		sram_area_per_core = (ul3_ + (al1.Size + wl1.Size + ol1.Size)*16) * SRAM_den;
+		mac_area_per_core = macs_per_core * MAC_den + LR_mac_num*LR_mac_den;
+	}else if(mm == 1){
+		auto dims = factorize_eyeriss_array(mac_dim);
+		eyeriss_x = dims.first;
+		eyeriss_y = dims.second;
+		macs_per_core = static_cast<Core::numMac_t>(eyeriss_x * eyeriss_y);
+		LR_mac_num = macs_per_core;
+
+		// Keep small local SRAMs fixed and use `_ul3` as configurable per-core global buffer.
+		_al1.Size = 4 KB;
+		_wl1.Size = 16 KB;
+		pl1.Size = 2 KB;
+		ul2.Size = ul3_;
+		SchNode::ubuf = ul2.Size;
+
+		sram_area_per_core = (_al1.Size + _wl1.Size + pl1.Size + ul2.Size) * SRAM_den;
+		mac_area_per_core = macs_per_core * MAC_den + LR_mac_num * LR_mac_den;
+	}else{
+		throw runtime_error("Core microarchitecture not supported.");
+	}
+
 	PolarCore::PESetting s(vector_len, lane_len, 0.018);
 	PolarCore::Bus bus(4, 4, 0.018, 64);
-	al1.Size = 8 * vector_len / 8 KB; 
-	ol1.Size = 2 * lane_len / 8 KB; 
-	wl1.Size = 4 * lane_len*vector_len / 64 KB; 
-	ol2.Size = 28 * vector_len * lane_len / 64 KB; 
-	wl2.Size = 0;//256 KB;
-	ul3.Size = ul3_; //16 64-bit IO 64KB 1-port MBSRAM
-	SchNode::ubuf = ul3.Size;
 
-	double tops = 16*vector_len*lane_len * Cluster::xlen * Cluster::ylen * 2;
+	double tops = static_cast<double>(macs_per_core) * Cluster::xlen * Cluster::ylen * 2;
 	tops /= 1024;
 	//NUMBER
 	double core_num = Cluster::xlen * Cluster::ylen;
@@ -1104,9 +1188,6 @@ int main(int argc, char** argv){
 	double DFT_prop = 1.05;
 
 	//*********************DIE AREA*********************
-	double sram_area_per_core = (ul3_ + (al1.Size + wl1.Size + ol1.Size)*16) * SRAM_den;
-	double mac_area_per_core = 16*vector_len * lane_len * MAC_den + LR_mac_num*LR_mac_den;
-	double NoC_area_per_core = NoC::NoC_bw * NoC_den;
 	double core_area = (sram_area_per_core + mac_area_per_core + NoC_area_per_core)*post_layout_scale;
 	double core_len = sqrt(core_area);
 	// double NoP_len_per_core = NoC::NoP_bw / 4 * NoP_len;
@@ -1209,41 +1290,39 @@ int main(int argc, char** argv){
 	
 	
 	al2.Size = 0;
-	al1.RCost = (buffer(vector_len * 8, al1.Size)[0]+0.1*lane_len/8) * 8 * turnover_factor *power_factor;
-	al1.WCost = buffer(vector_len * 8, al1.Size)[1] * 8 * turnover_factor * power_factor;
-	wl1.RCost = buffer(vector_len * 8, wl1.Size)[0] * 8 * turnover_factor * power_factor;
-	wl1.WCost = buffer(vector_len * 8, wl1.Size)[1] * 8 * turnover_factor * power_factor;
-	ol1.RCost = buffer(lane_len * 16, ol1.Size)[0] * 8 * turnover_factor * power_factor;
-	ol1.WCost = buffer(lane_len * 16, ol1.Size)[1] * 8 * turnover_factor * power_factor;
-	ol2.RCost = 0.07648125 * 8 * ul3_ / (1024 KB) * turnover_factor * power_factor;// ol2 is a small part of ul3
-	ol2.WCost = 0.0989875 * 8 * ul3_ / (1024 KB) *turnover_factor * power_factor;
-	ul3.RCost = 0.217125 * 8 * ul3_ /(1024 KB) * turnover_factor * power_factor; 
-	ul3.WCost = 0.234025 * 8 * ul3_ /(1024 KB)* turnover_factor * power_factor;  
+	if (mm == 0) {
+		al1.RCost = (buffer(vector_len * 8, al1.Size)[0]+0.1*lane_len/8) * 8 * turnover_factor *power_factor;
+		al1.WCost = buffer(vector_len * 8, al1.Size)[1] * 8 * turnover_factor * power_factor;
+		wl1.RCost = buffer(vector_len * 8, wl1.Size)[0] * 8 * turnover_factor * power_factor;
+		wl1.WCost = buffer(vector_len * 8, wl1.Size)[1] * 8 * turnover_factor * power_factor;
+		ol1.RCost = buffer(lane_len * 16, ol1.Size)[0] * 8 * turnover_factor * power_factor;
+		ol1.WCost = buffer(lane_len * 16, ol1.Size)[1] * 8 * turnover_factor * power_factor;
+		ol2.RCost = 0.07648125 * 8 * ul3_ / (1024 KB) * turnover_factor * power_factor;// ol2 is a small part of ul3
+		ol2.WCost = 0.0989875 * 8 * ul3_ / (1024 KB) *turnover_factor * power_factor;
+		ul3.RCost = 0.217125 * 8 * ul3_ /(1024 KB) * turnover_factor * power_factor; 
+		ul3.WCost = 0.234025 * 8 * ul3_ /(1024 KB)* turnover_factor * power_factor;  
+	}
 	al2.RCost = al2.WCost = 0 * power_factor;
 	wl2.RCost = wl2.WCost = 0 * power_factor;
 	
 	PolarCore core(s,bus,al1,wl1,ol1,al2,wl2,ol2,ul3,LR_mac_num,LR_mac_cost);
 	PolarMapper mapper(core);
 
-	EyerissCore::Buffer _al1, _wl1, pl1, ul2;
-	EyerissCore::PESetting s2(mac_dim, mac_dim, 0.018);
-	EyerissCore::Bus ibus(0.018, 64);
-	EyerissCore::Bus wbus(0.018, 64);
-	EyerissCore::Bus pbus(0.018, 64); // ifmap RC, weight RCK, psum RK
+	if (mm == 1) {
+		const auto al1_access = scaled_buffer(32, _al1.Size);
+		const auto wl1_access = scaled_buffer(32, _wl1.Size);
+		const auto pl1_access = scaled_buffer(64, pl1.Size);
+		_al1.RCost = al1_access[0] * 8 * turnover_factor * power_factor;
+		_al1.WCost = al1_access[1] * 8 * turnover_factor * power_factor;
+		_wl1.RCost = wl1_access[0] * 8 * turnover_factor * power_factor;
+		_wl1.WCost = wl1_access[1] * 8 * turnover_factor * power_factor;
+		pl1.RCost = pl1_access[0] * 8 * turnover_factor * power_factor;
+		pl1.WCost = pl1_access[1] * 8 * turnover_factor * power_factor;
+		ul2.RCost = 0.1317125 * 8 * ul2.Size / (1024 KB) * turnover_factor * power_factor;
+		ul2.WCost = 0.234025 * 8 * ul2.Size / (1024 KB) * turnover_factor * power_factor;
+	}
 
-	_al1.Size = 32;
-	pl1.Size = 1;
-	_wl1.Size = 128;
-	ul2.Size = 1024 KB;
-
-	_al1.RCost = 0.0509 * 8 * turnover_factor *power_factor; //8bit IO single port
-	_al1.WCost = 0.0506 * 8 * turnover_factor*power_factor;//0.045;
-	_wl1.RCost = 0.0545 * 8 * turnover_factor*power_factor; //Using 2 banks of 64
-	_wl1.WCost = 0.054 * 8 * turnover_factor*power_factor;//0.090;
-	pl1.RCost = pl1.WCost = 0.0 * turnover_factor*power_factor;
-	ul2.RCost = 0.1317125 * 8 * turnover_factor*power_factor;
-	ul2.WCost = 0.234025 * 8 * turnover_factor*power_factor;
-
+	EyerissCore::PESetting s2(eyeriss_x, eyeriss_y, 0.018);
 	EyerissCore core2(s2, ibus, wbus, pbus, _al1, _wl1, pl1, ul2, LR_mac_num, LR_mac_cost);
 	EyerissMapper mapper2(core2);
 
@@ -1441,6 +1520,13 @@ int main(int argc, char** argv){
 	cout << " Network " << net_name;
 	cout << " Mesh " << (int)Cluster::xlen << '*' << (int)Cluster::ylen;
 	cout << " Batch " << tot_batch << endl;
+	if (mm == 1) {
+		cout << "EyerissArray: " << eyeriss_x << 'x' << eyeriss_y
+			 << " LocalBuffers(KB): al1=" << (_al1.Size / 1024)
+			 << " wl1=" << (_wl1.Size / 1024)
+			 << " pl1=" << (pl1.Size / 1024)
+			 << " ul2=" << (ul2.Size / 1024) << endl;
+	}
 	cout << "compute_die_area: " << compute_die_area << endl;
 	cout << "IO_die_area: " << IO_die_area << endl;
 	cout << "cost_system_package: " << cost_system_package << endl;
@@ -1505,6 +1591,7 @@ int main(int argc, char** argv){
 		output(3);
 		cout << "chiplet_events_json: " << artifacts.chiplet_events_path << endl;
 		cout << "scalesim_topology_csv: " << artifacts.scalesim_topology_path << endl;
+		cout << "chiplet_timeline_txt: " << artifacts.chiplet_timeline_path << endl;
 		delete scheme;
 	}
 

@@ -33,14 +33,17 @@ Now, you can run the DSE script, such as:
 ```
 Wait for the execution to complete, and you will obtain the architecture exploration results. You can modify the DSE files to perform your own design space exploration experiments.
 
-# Chiplet Export
+# Chiplet 导出
 
-After mapping, Gemini now also exports:
+Gemini 在完成 mapping 后，现在还会额外导出两份文件：
 
 - `chiplet_events.json`
 - `scalesim_topology.csv`
+- `chiplet_timeline.txt`
 
-The detailed field definitions and export rules are documented in `EXPORT_FORMAT.md`.
+更完整的字段定义、聚合规则和运行方式见：
+
+- `EXPORT_FORMAT.md`
 
 # Clarification
 Many essential foundational components of Gemini are shared with the SET framework from the same project. We are currently updating the architecture and documentation of the SET framework. For urgent inquiries about Gemini, one can refer to the comments in SET (updated at 2025.2.1). Additionally, we plan to migrate and update these annotations from SET to Gemini and include comments related to code unique to Gemini.

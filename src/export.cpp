@@ -4,11 +4,14 @@
 #include <array>
 #include <cctype>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <map>
 #include <set>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -86,6 +89,427 @@ struct ScalesimRow {
 	len_t batch_size = 0;
 };
 
+enum class WorkloadPhase {
+	Read,
+	Compute,
+	Write,
+	Done
+};
+
+struct EventRuntime {
+	int event_id = -1;
+	int chiplet_id = -1;
+	cycle_t sort_time = 0;
+	int type_rank = 0;
+	Json::Value payload;
+	std::vector<SchNode::wlid_t> workload_ids;
+};
+
+struct WorkloadRuntime {
+	SchNode::wlid_t workload_id = 0;
+	int core_id = -1;
+	std::set<int> pending_read_events;
+	int compute_event_id = -1;
+	bool compute_done = false;
+	std::set<int> pending_write_events;
+};
+
+struct CoreRuntime {
+	int core_id = -1;
+	int chiplet_id = -1;
+	std::vector<SchNode::wlid_t> workload_order;
+	size_t current_index = 0;
+};
+
+void sort_chiplet_event_vectors(std::map<int, std::vector<GenericEvent>>& chiplet_events) {
+	for(auto& [chiplet_id, events] : chiplet_events) {
+		(void)chiplet_id;
+		std::stable_sort(events.begin(), events.end(), [](const GenericEvent& lhs, const GenericEvent& rhs) {
+			return std::tie(lhs.sort_time, lhs.type_rank) < std::tie(rhs.sort_time, rhs.type_rank);
+		});
+	}
+}
+
+std::vector<SchNode::wlid_t> event_workload_ids(const Json::Value& payload) {
+	std::vector<SchNode::wlid_t> workload_ids;
+	const Json::Value& json_ids = payload["workload_ids"];
+	if(!json_ids.isArray()) {
+		return workload_ids;
+	}
+	workload_ids.reserve(json_ids.size());
+	for(Json::Value::ArrayIndex i = 0; i < json_ids.size(); ++i) {
+		workload_ids.push_back(json_ids[i].asUInt());
+	}
+	return workload_ids;
+}
+
+std::vector<EventRuntime> flatten_chiplet_events(const std::map<int, std::vector<GenericEvent>>& chiplet_events) {
+	std::vector<EventRuntime> flattened;
+	int event_id = 0;
+	for(const auto& [chiplet_id, events] : chiplet_events) {
+		for(const GenericEvent& event : events) {
+			EventRuntime runtime;
+			runtime.event_id = event_id++;
+			runtime.chiplet_id = chiplet_id;
+			runtime.sort_time = event.sort_time;
+			runtime.type_rank = event.type_rank;
+			runtime.payload = event.payload;
+			runtime.workload_ids = event_workload_ids(event.payload);
+			flattened.push_back(std::move(runtime));
+		}
+	}
+	return flattened;
+}
+
+WorkloadPhase workload_phase(const WorkloadRuntime& workload) {
+	if(!workload.pending_read_events.empty()) {
+		return WorkloadPhase::Read;
+	}
+	if(!workload.compute_done) {
+		return WorkloadPhase::Compute;
+	}
+	if(!workload.pending_write_events.empty()) {
+		return WorkloadPhase::Write;
+	}
+	return WorkloadPhase::Done;
+}
+
+void advance_core(CoreRuntime& core, const std::map<SchNode::wlid_t, WorkloadRuntime>& workloads) {
+	while(core.current_index < core.workload_order.size()) {
+		const auto it = workloads.find(core.workload_order[core.current_index]);
+		if(it == workloads.end()) {
+			throw std::runtime_error("core runtime references unknown workload");
+		}
+		if(workload_phase(it->second) != WorkloadPhase::Done) {
+			return;
+		}
+		++core.current_index;
+	}
+}
+
+std::vector<int> current_candidate_event_ids(
+	CoreRuntime& core,
+	const std::map<SchNode::wlid_t, WorkloadRuntime>& workloads
+) {
+	advance_core(core, workloads);
+	if(core.current_index >= core.workload_order.size()) {
+		return {};
+	}
+
+	const auto it = workloads.find(core.workload_order[core.current_index]);
+	if(it == workloads.end()) {
+		throw std::runtime_error("current core workload state is missing");
+	}
+	const WorkloadRuntime& workload = it->second;
+	switch(workload_phase(workload)) {
+	case WorkloadPhase::Read:
+		return {workload.pending_read_events.begin(), workload.pending_read_events.end()};
+	case WorkloadPhase::Compute:
+		return workload.compute_event_id >= 0 ? std::vector<int>{workload.compute_event_id} : std::vector<int>{};
+	case WorkloadPhase::Write:
+		return {workload.pending_write_events.begin(), workload.pending_write_events.end()};
+	case WorkloadPhase::Done:
+		break;
+	}
+	return {};
+}
+
+bool transfer_ids_equal(const Json::Value& lhs, const Json::Value& rhs) {
+	if(!lhs.isArray() || !rhs.isArray() || lhs.size() != rhs.size()) {
+		return false;
+	}
+	for(Json::Value::ArrayIndex i = 0; i < lhs.size(); ++i) {
+		if(lhs[i].asUInt() != rhs[i].asUInt()) {
+			return false;
+		}
+	}
+	return true;
+}
+
+bool event_is_directly_poppable(const EventRuntime& event) {
+	const std::string type = event.payload["type"].asString();
+	if(type == "compute") {
+		return true;
+	}
+	return event.payload["peer"]["kind"].asString() == "dram";
+}
+
+bool event_pair_matches(const EventRuntime& lhs, const EventRuntime& rhs) {
+	const std::string lhs_type = lhs.payload["type"].asString();
+	const std::string rhs_type = rhs.payload["type"].asString();
+	if(!((lhs_type == "read" && rhs_type == "write") || (lhs_type == "write" && rhs_type == "read"))) {
+		return false;
+	}
+	if(lhs.payload["peer"]["kind"].asString() != "chiplet" || rhs.payload["peer"]["kind"].asString() != "chiplet") {
+		return false;
+	}
+	return lhs.payload["peer"]["chiplet_id"].asInt() == rhs.chiplet_id &&
+		rhs.payload["peer"]["chiplet_id"].asInt() == lhs.chiplet_id &&
+		transfer_ids_equal(lhs.payload["transfer_ids"], rhs.payload["transfer_ids"]);
+}
+
+bool event_ready(
+	const EventRuntime& event,
+	std::map<SchNode::wlid_t, WorkloadRuntime>& workloads,
+	std::map<int, CoreRuntime>& cores
+) {
+	if(event.workload_ids.empty()) {
+		return false;
+	}
+
+	std::set<int> touched_cores;
+	for(SchNode::wlid_t workload_id : event.workload_ids) {
+		const auto workload_it = workloads.find(workload_id);
+		if(workload_it == workloads.end()) {
+			throw std::runtime_error("event references unknown workload id");
+		}
+		touched_cores.insert(workload_it->second.core_id);
+	}
+	for(int core_id : touched_cores) {
+		auto core_it = cores.find(core_id);
+		if(core_it == cores.end()) {
+			throw std::runtime_error("event references unknown core runtime");
+		}
+		advance_core(core_it->second, workloads);
+	}
+
+	const std::string type = event.payload["type"].asString();
+	for(SchNode::wlid_t workload_id : event.workload_ids) {
+		const WorkloadRuntime& workload = workloads.at(workload_id);
+		const CoreRuntime& core = cores.at(workload.core_id);
+		if(core.current_index >= core.workload_order.size() || core.workload_order[core.current_index] != workload_id) {
+			return false;
+		}
+		switch(workload_phase(workload)) {
+		case WorkloadPhase::Read:
+			if(type != "read" || workload.pending_read_events.count(event.event_id) == 0) {
+				return false;
+			}
+			break;
+		case WorkloadPhase::Compute:
+			if(type != "compute" || workload.compute_done || workload.compute_event_id != event.event_id) {
+				return false;
+			}
+			break;
+		case WorkloadPhase::Write:
+			if(type != "write" || workload.pending_write_events.count(event.event_id) == 0) {
+				return false;
+			}
+			break;
+		case WorkloadPhase::Done:
+			return false;
+		}
+	}
+	return true;
+}
+
+void pop_event(
+	const EventRuntime& event,
+	std::map<SchNode::wlid_t, WorkloadRuntime>& workloads,
+	std::map<int, CoreRuntime>& cores
+) {
+	const std::string type = event.payload["type"].asString();
+	std::set<int> touched_cores;
+	for(SchNode::wlid_t workload_id : event.workload_ids) {
+		auto workload_it = workloads.find(workload_id);
+		if(workload_it == workloads.end()) {
+			throw std::runtime_error("cannot pop event for unknown workload");
+		}
+		WorkloadRuntime& workload = workload_it->second;
+		touched_cores.insert(workload.core_id);
+		if(type == "read") {
+			workload.pending_read_events.erase(event.event_id);
+		} else if(type == "compute") {
+			if(workload.compute_event_id != event.event_id) {
+				throw std::runtime_error("compute event does not match workload runtime");
+			}
+			workload.compute_done = true;
+		} else if(type == "write") {
+			workload.pending_write_events.erase(event.event_id);
+		} else {
+			throw std::runtime_error("unknown event type while popping event");
+		}
+	}
+	for(int core_id : touched_cores) {
+		advance_core(cores.at(core_id), workloads);
+	}
+}
+
+std::map<int, std::vector<int>> build_runtime_states(
+	const std::map<SchNode::wlid_t, WorkloadMeta>& workload_meta,
+	const std::vector<EventRuntime>& events,
+	std::map<SchNode::wlid_t, WorkloadRuntime>& workloads,
+	std::map<int, CoreRuntime>& cores
+) {
+	std::map<int, std::vector<std::pair<cycle_t, SchNode::wlid_t>>> workloads_by_core;
+	for(const auto& [workload_id, meta] : workload_meta) {
+		WorkloadRuntime state;
+		state.workload_id = workload_id;
+		state.core_id = meta.core_id;
+		workloads.emplace(workload_id, std::move(state));
+		workloads_by_core[meta.core_id].push_back({meta.start_time, workload_id});
+	}
+
+	for(const EventRuntime& event : events) {
+		const std::string type = event.payload["type"].asString();
+		for(SchNode::wlid_t workload_id : event.workload_ids) {
+			auto workload_it = workloads.find(workload_id);
+			if(workload_it == workloads.end()) {
+				throw std::runtime_error("event payload references an unknown workload id");
+			}
+			WorkloadRuntime& workload = workload_it->second;
+			if(type == "read") {
+				workload.pending_read_events.insert(event.event_id);
+			} else if(type == "compute") {
+				if(workload.compute_event_id >= 0) {
+					throw std::runtime_error("workload is associated with multiple compute events");
+				}
+				workload.compute_event_id = event.event_id;
+			} else if(type == "write") {
+				workload.pending_write_events.insert(event.event_id);
+			}
+		}
+	}
+
+	std::map<int, std::vector<int>> chiplet_cores;
+	for(auto& [core_id, core_workloads] : workloads_by_core) {
+		std::sort(core_workloads.begin(), core_workloads.end(), [](const auto& lhs, const auto& rhs) {
+			return std::tie(lhs.first, lhs.second) < std::tie(rhs.first, rhs.second);
+		});
+		CoreRuntime core;
+		core.core_id = core_id;
+		for(const auto& [start_time, workload_id] : core_workloads) {
+			(void)start_time;
+			core.workload_order.push_back(workload_id);
+		}
+		if(core.workload_order.empty()) {
+			continue;
+		}
+		const auto meta_it = workload_meta.find(core.workload_order.front());
+		if(meta_it == workload_meta.end()) {
+			throw std::runtime_error("missing workload metadata while building core runtime");
+		}
+		core.chiplet_id = meta_it->second.chiplet_id;
+		cores.emplace(core_id, core);
+		chiplet_cores[core.chiplet_id].push_back(core_id);
+	}
+
+	for(auto& [chiplet_id, core_ids] : chiplet_cores) {
+		(void)chiplet_id;
+		std::sort(core_ids.begin(), core_ids.end());
+	}
+	for(const auto& [workload_id, workload] : workloads) {
+		(void)workload_id;
+		if(workload.compute_event_id < 0) {
+			throw std::runtime_error("workload runtime is missing a compute event");
+		}
+	}
+	return chiplet_cores;
+}
+
+std::vector<int> chiplet_candidate_event_ids(
+	int chiplet_id,
+	const std::map<int, std::vector<int>>& chiplet_cores,
+	std::map<int, CoreRuntime>& cores,
+	const std::map<SchNode::wlid_t, WorkloadRuntime>& workloads
+) {
+	std::set<int> candidate_ids;
+	const auto chiplet_it = chiplet_cores.find(chiplet_id);
+	if(chiplet_it == chiplet_cores.end()) {
+		return {};
+	}
+	for(int core_id : chiplet_it->second) {
+		auto core_it = cores.find(core_id);
+		if(core_it == cores.end()) {
+			throw std::runtime_error("chiplet runtime references unknown core");
+		}
+		const auto candidates = current_candidate_event_ids(core_it->second, workloads);
+		candidate_ids.insert(candidates.begin(), candidates.end());
+	}
+	return {candidate_ids.begin(), candidate_ids.end()};
+}
+
+std::map<int, std::vector<GenericEvent>> build_pairable_chiplet_events(
+	const std::map<int, std::vector<GenericEvent>>& raw_chiplet_events,
+	const std::map<SchNode::wlid_t, WorkloadMeta>& workload_meta
+) {
+	auto sorted_events_by_chiplet = raw_chiplet_events;
+	sort_chiplet_event_vectors(sorted_events_by_chiplet);
+	const auto events = flatten_chiplet_events(sorted_events_by_chiplet);
+
+	std::map<SchNode::wlid_t, WorkloadRuntime> workloads;
+	std::map<int, CoreRuntime> cores;
+	const auto chiplet_cores = build_runtime_states(workload_meta, events, workloads, cores);
+
+	std::map<int, std::vector<GenericEvent>> reordered_events;
+	size_t popped_event_count = 0;
+	while(popped_event_count < events.size()) {
+		bool progress = false;
+
+		while(true) {
+			bool direct_progress = false;
+			for(const auto& [chiplet_id, core_ids] : chiplet_cores) {
+				(void)core_ids;
+				for(int event_id : chiplet_candidate_event_ids(chiplet_id, chiplet_cores, cores, workloads)) {
+					const EventRuntime& event = events.at(static_cast<size_t>(event_id));
+					if(!event_is_directly_poppable(event) || !event_ready(event, workloads, cores)) {
+						continue;
+					}
+					pop_event(event, workloads, cores);
+					reordered_events[chiplet_id].push_back({event.sort_time, event.type_rank, event.payload});
+					++popped_event_count;
+					direct_progress = true;
+					progress = true;
+					break;
+				}
+			}
+			if(!direct_progress) {
+				break;
+			}
+		}
+
+		bool pair_progress = false;
+		std::vector<std::pair<int, int>> ready_transfers;
+		for(const auto& [chiplet_id, core_ids] : chiplet_cores) {
+			(void)core_ids;
+			for(int event_id : chiplet_candidate_event_ids(chiplet_id, chiplet_cores, cores, workloads)) {
+				const EventRuntime& event = events.at(static_cast<size_t>(event_id));
+				if(event_is_directly_poppable(event) || !event_ready(event, workloads, cores)) {
+					continue;
+				}
+				ready_transfers.push_back({chiplet_id, event_id});
+			}
+		}
+
+		for(size_t i = 0; i < ready_transfers.size() && !pair_progress; ++i) {
+			const EventRuntime& lhs = events.at(static_cast<size_t>(ready_transfers[i].second));
+			for(size_t j = i + 1; j < ready_transfers.size(); ++j) {
+				const EventRuntime& rhs = events.at(static_cast<size_t>(ready_transfers[j].second));
+				if(!event_pair_matches(lhs, rhs)) {
+					continue;
+				}
+				pop_event(lhs, workloads, cores);
+				pop_event(rhs, workloads, cores);
+				reordered_events[lhs.chiplet_id].push_back({lhs.sort_time, lhs.type_rank, lhs.payload});
+				reordered_events[rhs.chiplet_id].push_back({rhs.sort_time, rhs.type_rank, rhs.payload});
+				popped_event_count += 2;
+				pair_progress = true;
+				progress = true;
+				break;
+			}
+		}
+
+		if(!progress) {
+			std::ostringstream oss;
+			oss << "failed to reconstruct a fully pairable chiplet event order; "
+				<< "popped " << popped_event_count << " of " << events.size() << " events";
+			throw std::runtime_error(oss.str());
+		}
+	}
+
+	return reordered_events;
+}
+
 Json::Value json_u64(std::uint64_t value) {
 	return Json::Value(static_cast<double>(value));
 }
@@ -103,6 +527,12 @@ std::string sanitize_name(const std::string& value) {
 std::uint64_t bits_to_bytes(const Json::Value& value) {
 	const double bits = value.asDouble();
 	return static_cast<std::uint64_t>((bits + 7.0) / 8.0);
+}
+
+std::string u64_to_string(std::uint64_t value) {
+	std::ostringstream oss;
+	oss << value;
+	return oss.str();
 }
 
 std::filesystem::path output_dir_from_hint(const std::string& output_hint_path) {
@@ -358,6 +788,154 @@ void write_scalesim_csv(const std::filesystem::path& csv_path, const std::vector
 			<< row.stride_h << ','
 			<< row.stride_w << ','
 			<< row.batch_size << ",\n";
+	}
+}
+
+std::string join_json_array(const Json::Value& array) {
+	std::ostringstream oss;
+	for(Json::Value::ArrayIndex i = 0; i < array.size(); ++i) {
+		if(i != 0) {
+			oss << ", ";
+		}
+		oss << array[i].asUInt();
+	}
+	return oss.str();
+}
+
+std::string format_box_text(const Json::Value& box) {
+	if(!box.isObject() || !box.isMember("lower") || !box.isMember("upper")) {
+		return "-";
+	}
+	std::ostringstream oss;
+	oss << '[';
+	for(Json::Value::ArrayIndex i = 0; i < box["lower"].size(); ++i) {
+		if(i != 0) {
+			oss << ", ";
+		}
+		oss << box["lower"][i].asUInt() << ':' << box["upper"][i].asUInt();
+	}
+	oss << ']';
+	return oss.str();
+}
+
+std::string format_layer_shape_text(const Json::Value& shape) {
+	if(!shape.isObject() || !shape.isMember("kind")) {
+		return "-";
+	}
+	std::ostringstream oss;
+	const std::string kind = shape["kind"].asString();
+	oss << kind;
+	if(kind == "group_conv2d") {
+		oss << "(G=" << shape["groups"].asUInt()
+			<< ", C=" << shape["channels"].asUInt()
+			<< ", K=" << shape["num_filters"].asUInt()
+			<< ", H=" << shape["ofmap_h"].asUInt()
+			<< ", W=" << shape["ofmap_w"].asUInt()
+			<< ", R=" << shape["filter_h"].asUInt()
+			<< ", S=" << shape["filter_w"].asUInt()
+			<< ", sH=" << shape["stride_h"].asUInt()
+			<< ", sW=" << shape["stride_w"].asUInt()
+			<< ')';
+		return oss.str();
+	}
+	if(kind == "conv2d") {
+		oss << "(C=" << shape["channels"].asUInt()
+			<< ", K=" << shape["num_filters"].asUInt()
+			<< ", H=" << shape["ofmap_h"].asUInt()
+			<< ", W=" << shape["ofmap_w"].asUInt()
+			<< ", R=" << shape["filter_h"].asUInt()
+			<< ", S=" << shape["filter_w"].asUInt()
+			<< ", sH=" << shape["stride_h"].asUInt()
+			<< ", sW=" << shape["stride_w"].asUInt()
+			<< ')';
+		return oss.str();
+	}
+	if(kind == "fc") {
+		oss << "(C=" << shape["channels"].asUInt()
+			<< ", K=" << shape["num_filters"].asUInt()
+			<< ", IFMAP_H=" << shape["ifmap_h"].asUInt()
+			<< ", IFMAP_W=" << shape["ifmap_w"].asUInt()
+			<< ')';
+		return oss.str();
+	}
+	if(kind == "other") {
+		oss << "(ifmap_size=" << u64_to_string(static_cast<std::uint64_t>(shape["ifmap_size"].asDouble()))
+			<< ", ofmap_c=" << shape["ofmap_channels"].asUInt()
+			<< ", ofmap_h=" << shape["ofmap_h"].asUInt()
+			<< ", ofmap_w=" << shape["ofmap_w"].asUInt()
+			<< ')';
+		return oss.str();
+	}
+	return kind;
+}
+
+void write_chiplet_timeline_text(const std::filesystem::path& txt_path, const Json::Value& chiplet_json) {
+	std::ofstream out(txt_path);
+	const Json::Value& metadata = chiplet_json["metadata"];
+	out << "Gemini Chiplet Timeline\n";
+	out << "network_name: " << metadata["network_name"].asString() << '\n';
+	out << "mesh: " << metadata["xlen"].asUInt() << 'x' << metadata["ylen"].asUInt() << '\n';
+	out << "chiplet_grid: " << metadata["x_cut"].asUInt() << 'x' << metadata["y_cut"].asUInt() << '\n';
+	out << "chiplet_step: " << metadata["x_step"].asUInt() << 'x' << metadata["y_step"].asUInt() << '\n';
+	out << "chiplet_count: " << metadata["chiplet_count"].asUInt() << '\n';
+	out << "source: " << metadata["source"].asString() << "\n\n";
+
+	for(const Json::Value& chiplet : chiplet_json["chiplets"]) {
+		out << "================================================================================\n";
+		out << "chiplet " << chiplet["chiplet_id"].asUInt()
+			<< " (x=" << chiplet["chiplet_x"].asUInt()
+			<< ", y=" << chiplet["chiplet_y"].asUInt() << ")\n";
+		out << "cores: [" << join_json_array(chiplet["core_ids"]) << "]\n";
+		out << "events:\n";
+
+		for(const Json::Value& event : chiplet["events"]) {
+			const std::string type = event["type"].asString();
+			if(type == "read") {
+				out << "  [t=" << u64_to_string(static_cast<std::uint64_t>(event["time"].asDouble())) << "] "
+					<< "READ  "
+					<< event["tensor_type"].asString() << ' '
+					<< u64_to_string(static_cast<std::uint64_t>(event["bytes"].asDouble())) << " B"
+					<< "  from ";
+				if(event["peer"]["kind"].asString() == "dram") {
+					out << "DRAM";
+				} else {
+					out << "chiplet " << event["peer"]["chiplet_id"].asUInt();
+				}
+				out << "  for layer " << event["layer_name"].asString() << '\n';
+				continue;
+			}
+
+			if(type == "write") {
+				out << "  [t=" << u64_to_string(static_cast<std::uint64_t>(event["time"].asDouble())) << "] "
+					<< "WRITE "
+					<< event["tensor_type"].asString() << ' '
+					<< u64_to_string(static_cast<std::uint64_t>(event["bytes"].asDouble())) << " B"
+					<< "  to ";
+				if(event["peer"]["kind"].asString() == "dram") {
+					out << "DRAM";
+				} else {
+					out << "chiplet " << event["peer"]["chiplet_id"].asUInt();
+				}
+				out << "  from layer " << event["layer_name"].asString() << '\n';
+				continue;
+			}
+
+			if(type == "compute") {
+				out << "  [t=" << u64_to_string(static_cast<std::uint64_t>(event["time_start"].asDouble()))
+					<< " -> " << u64_to_string(static_cast<std::uint64_t>(event["time_end"].asDouble()))
+					<< ", dur=" << u64_to_string(static_cast<std::uint64_t>(event["duration"].asDouble())) << "] "
+					<< "COMPUTE "
+					<< event["layer_name"].asString()
+					<< "  type=" << event["layer_type"].asString()
+					<< "  shape=" << format_layer_shape_text(event["layer_shape"])
+					<< "  cores=[" << join_json_array(event["core_ids"]) << "]"
+					<< "  partitions=" << event["partition_count"].asUInt()
+					<< '\n';
+				out << "    ifmap=" << format_box_text(event["ifmap"])
+					<< "  ofmap=" << format_box_text(event["ofmap"]) << '\n';
+			}
+		}
+		out << '\n';
 	}
 }
 
@@ -619,6 +1197,9 @@ ExportArtifacts export_chiplet_artifacts(
 	chiplet_json["metadata"]["y_step"] = NoC::y_step;
 	chiplet_json["metadata"]["chiplet_count"] = NoC::x_cut * NoC::y_cut;
 	chiplet_json["metadata"]["source"] = "Gemini per-core IR";
+	chiplet_json["metadata"]["event_order"] = "pairable_per_core_reconstructed";
+
+	auto ordered_chiplet_events = build_pairable_chiplet_events(chiplet_events, workload_meta);
 
 	for(int chiplet_y = 0; chiplet_y < NoC::y_cut; ++chiplet_y) {
 		for(int chiplet_x = 0; chiplet_x < NoC::x_cut; ++chiplet_x) {
@@ -630,10 +1211,7 @@ ExportArtifacts export_chiplet_artifacts(
 			for(int core_id : chiplet_core_ids[chiplet_id]) {
 				chiplet_entry["core_ids"].append(core_id);
 			}
-			auto& events = chiplet_events[chiplet_id];
-			std::sort(events.begin(), events.end(), [](const GenericEvent& lhs, const GenericEvent& rhs) {
-				return std::tie(lhs.sort_time, lhs.type_rank) < std::tie(rhs.sort_time, rhs.type_rank);
-			});
+			auto& events = ordered_chiplet_events[chiplet_id];
 			for(size_t event_index = 0; event_index < events.size(); ++event_index) {
 				events[event_index].payload["seq"] = static_cast<Json::Value::UInt>(event_index);
 				chiplet_entry["events"].append(events[event_index].payload);
@@ -648,10 +1226,12 @@ ExportArtifacts export_chiplet_artifacts(
 	ExportArtifacts artifacts;
 	artifacts.chiplet_events_path = (output_dir / "chiplet_events.json").string();
 	artifacts.scalesim_topology_path = (output_dir / "scalesim_topology.csv").string();
+	artifacts.chiplet_timeline_path = (output_dir / "chiplet_timeline.txt").string();
 
 	Json::StyledWriter writer;
 	std::ofstream json_ofs(artifacts.chiplet_events_path);
 	json_ofs << writer.write(chiplet_json);
 	write_scalesim_csv(artifacts.scalesim_topology_path, csv_rows);
+	write_chiplet_timeline_text(artifacts.chiplet_timeline_path, chiplet_json);
 	return artifacts;
 }

@@ -8,6 +8,7 @@ class SchNode;
 struct ExportArtifacts {
 	std::string chiplet_events_path;
 	std::string scalesim_topology_path;
+	std::string chiplet_timeline_path;
 };
 
 ExportArtifacts export_chiplet_artifacts(
