@@ -55,19 +55,20 @@ TECH="${TECH:-12}"
 #   15=BERT_block
 #   16=GPT2_prefill_block
 #   17=GPT2_decode_block
-NETWORK_ID="${NETWORK_ID:-10}"
+#   18=resnet_small
+NETWORK_ID="${NETWORK_ID:-18}"
 
 # 核心网格尺寸。
 # 在 `mm=1` 下，这同时也是 chiplet 网格尺寸，因为 1 chiplet = 1 core。
-XX="${XX:-4}"
-YY="${YY:-4}"
+XX="${XX:-1}"
+YY="${YY:-1}"
 
 # Cluster stride。
 # 一般保持 1。
 STRIDE="${STRIDE:-1}"
 
 # batch size。
-BATCH_SIZE="${BATCH_SIZE:-16}"
+BATCH_SIZE="${BATCH_SIZE:-4}"
 
 # 映射搜索轮数。
 # 这里只做单次网络映射，不做架构探索。
@@ -142,6 +143,7 @@ network_name_from_id() {
     15) echo "BERT_block" ;;
     16) echo "GPT2_prefill_block" ;;
     17) echo "GPT2_decode_block" ;;
+    18) echo "resnet_small" ;;
     *) echo "network${1}" ;;
   esac
 }

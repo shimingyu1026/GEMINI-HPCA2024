@@ -13,6 +13,7 @@ extern const Network inception_resnet_v1;
 extern const Network resnet50;
 extern const Network resnet101;
 extern const Network resnet152;
+extern const Network resnet_small;
 
 //extern Network vgg16;
 extern const Network vgg19;

@@ -3,6 +3,7 @@
 static constexpr int seg_lens_50[] = {3,4,6,3};
 static constexpr int seg_lens_101[] = {3,4,23,3};
 static constexpr int seg_lens_152[] = {3,8,36,3};
+static constexpr int seg_lens_small[] = {1,1,1,1};
 
 // Bottleneck block.
 static void btn_blk(
@@ -109,4 +110,5 @@ static Network gen_resnext(const int* seg_lens){
 const Network resnet50 = gen_resnet(seg_lens_50);
 const Network resnet101 = gen_resnet(seg_lens_101);
 const Network resnet152 = gen_resnet(seg_lens_152);
+const Network resnet_small = gen_resnet(seg_lens_small);
 const Network resnext50 = gen_resnext(seg_lens_50);

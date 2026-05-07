@@ -1423,6 +1423,10 @@ int main(int argc, char** argv){
 		network = &GPT2_decode_block;
 		net_name="gpt_decode";
 		break;
+	case 18:
+		network = &resnet_small;
+		net_name="resnet_small";
+		break;
 	// TODO: Support more DNNs.
 	default:
 		throw runtime_error("Model not supported.");
