@@ -37,5 +37,10 @@ extern const Network BERT_block;
 extern const Network GPT2_prefill_block;
 // extern const Network GPT2_decode;
 extern const Network GPT2_decode_block;
+
+extern const Network Qwen35_full_prefill_block;
+extern const Network Qwen35_full_decode_block;
+extern const Network Qwen35_linear_prefill_block;
+extern const Network Qwen35_linear_decode_block;
 Network gen_network(std::string model_name);
 #endif // NNS_H
