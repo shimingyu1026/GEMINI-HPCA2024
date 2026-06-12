@@ -56,10 +56,8 @@ TECH="${TECH:-12}"
 #   16=GPT2_prefill_block
 #   17=GPT2_decode_block
 #   18=resnet_small
-#   19=qwen35_full_prefill
-#   20=qwen35_full_decode
-#   21=qwen35_linear_prefill
-#   22=qwen35_linear_decode
+#   19=qwen3_prefill
+#   20=qwen3_decode
 NETWORK_ID="${NETWORK_ID:-18}"
 
 # 核心网格尺寸。
@@ -148,10 +146,8 @@ network_name_from_id() {
     16) echo "GPT2_prefill_block" ;;
     17) echo "GPT2_decode_block" ;;
     18) echo "resnet_small" ;;
-    19) echo "qwen35_full_prefill" ;;
-    20) echo "qwen35_full_decode" ;;
-    21) echo "qwen35_linear_prefill" ;;
-    22) echo "qwen35_linear_decode" ;;
+    19) echo "qwen3_prefill" ;;
+    20) echo "qwen3_decode" ;;
     *) echo "network${1}" ;;
   esac
 }

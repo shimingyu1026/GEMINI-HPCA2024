@@ -184,7 +184,7 @@ mkdir $output_path
 max_dir_depth=16
 
 # ************************* Other Parameters *************************
-network=(darknet19 vgg resnet50 googlenet resnet101 densenet ires gnmt lstm zfnet transformer transformer_cell pnasnet resnext50 resnet152 bert_block GPT2_prefill_block GPT2_decode_block resnet_small qwen35_full_prefill qwen35_full_decode qwen35_linear_prefill qwen35_linear_decode)
+network=(darknet19 vgg resnet50 googlenet resnet101 densenet ires gnmt lstm zfnet transformer transformer_cell pnasnet resnext50 resnet152 bert_block GPT2_prefill_block GPT2_decode_block resnet_small qwen3_prefill qwen3_decode)
 # chiplet number : 1 2 4 9 18 36
 cut_long=(1 2 2 3 6 6)
 cut_short=(1 1 2 3 3 6)

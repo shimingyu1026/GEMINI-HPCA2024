@@ -1428,20 +1428,12 @@ int main(int argc, char** argv){
 		net_name="resnet_small";
 		break;
 	case 19:
-		network = &Qwen35_full_prefill_block;
-		net_name="qwen35_full_prefill";
+		network = &Qwen3_prefill_block;
+		net_name="qwen3_prefill";
 		break;
 	case 20:
-		network = &Qwen35_full_decode_block;
-		net_name="qwen35_full_decode";
-		break;
-	case 21:
-		network = &Qwen35_linear_prefill_block;
-		net_name="qwen35_linear_prefill";
-		break;
-	case 22:
-		network = &Qwen35_linear_decode_block;
-		net_name="qwen35_linear_decode";
+		network = &Qwen3_decode_block;
+		net_name="qwen3_decode";
 		break;
 	// TODO: Support more DNNs.
 	default:
